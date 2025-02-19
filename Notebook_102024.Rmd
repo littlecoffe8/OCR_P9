@@ -1,0 +1,1835 @@
+---
+title: Parcours Data Analyst - Projet 9 : Analysez les ventes d'une librairie
+author: Marie GROSHENS
+date: 30/10/2024
+output: pdf_document
+---
+
+#Importation des librairies, des fichiers, et analyse exploratoire
+
+##Importation des librairies
+
+```{r}
+library(tidyverse) # Manipulation de dataframes et affichage de graphiques ggplot
+library(funModeling) # Analyse et nettoyage de données
+library(DataExplorer) # Analyse exploratoire de données
+library(lubridate) # GEstgion des dates
+library(zoo) # Séries temprorelles
+library(scales) # Configuration des breaks pour les axes des graphiques
+library(ggthemes) # theme classique pour les graphiques
+library(gglorenz) # Courbe de Lorenz
+library(rstatix) # test Kruskal-Wallis
+library(pheatmap) # Affichage de cartes de chaleur
+library(ineq) # indice de Gini
+```
+
+## Import des fichiers csv
+
+On importe les données de la librairie : \* liste des clients \* liste des produits vendus \* liste des transactions de mars 2021 à février 2023
+
+```{r}
+customers <- read.csv("Ressources/data/customers.csv", sep = ";")
+products <- read.csv("Ressources/data/products.csv", sep = ";")
+transactions <- read.csv("Ressources/data/transactions.csv", sep = ";", na.strings = c(""))
+```
+
+## Analyse exploratoire de customers
+
+Affichage des données de chaque table
+
+```{r}
+summary(customers)
+```
+
+```{r}
+df_status(customers)
+```
+
+Vérification de l'unicité de la clé client_id et recherche de valeurs nulles
+
+```{r}
+
+cat('Nombre de champs vides pour client_id : ', sum(customers$client_id == ''))
+```
+
+Affichage des valeurs de la colonne sex
+
+```{r}
+plot_bar(customers$sex)
+
+```
+
+Pour chaque client, nous disponsons de son genre, de son identifiant et de sa date de naissance. L'identifiant est unique et toutes les donneés sont renseignées
+
+## Analyse exploratoire de products
+
+```{r}
+summary(products)
+```
+
+```{r}
+df_status(products)
+```
+
+Vérification des champs vides
+
+```{r}
+cat('Nombre de champs vides de id_prod : ', sum(products$id_prod == ''))
+cat('\nNombre de champs vides de price : ', sum(products$price == ''))
+cat('\nNombre de champs vides de categ : ', sum(products$categ == ''))
+```
+
+Affichage des valeurs de catégorie
+
+```{r}
+
+# Conversion en character du numéro de catégorie, pour le traitement et l'affichage ultérieur
+products$categ = as.character(products$categ)
+
+# Affichage des valeurs prises par "categ"
+plot_bar(products$categ)
+
+```
+
+Pour chaque produit, nous avons une clé unique (id_prod), une catégorie (0,1 ou 2), et un prix de vente Tous les champs sont renseignés
+
+## Analyse exploratoire de transactions
+
+```{r}
+summary(transactions)
+cat('\n')
+str(transactions)
+```
+
+```{r}
+df_status(transactions)
+
+```
+
+On observe 361 041 valeurs NA pour chaque colonne, ce qui laisse supposer des lignes vides dans le fichier. On vérifie cette hypothèse et on supprime les lignes concernées
+
+```{r}
+
+# On vérifie que les lignes contenant des NA sont bien vides
+a_supprimer = transactions |> filter(is.na(transactions$id_prod))
+df_status(a_supprimer)
+rm(a_supprimer)
+```
+
+On a bien des lignes vides lorsque id_prod est vide : on supprime donc les lignes concernées et on vérifie que la table transaction ne contient plus de NA
+
+```{r}
+transactions = na.omit(transactions)
+df_status(transactions)
+```
+
+Recherche d'une clé unique : session_id ne convient pas ; on crée donc un index pour la table transactions.
+
+```{r}
+cat('Nombre de doublons de session_id : ',sum(duplicated(transactions$session_id)))
+cat('\n')
+cat('Nombre de valeurs nulles de session_id : ',sum(is.na(transactions$session_id)))
+
+
+# Ajout d'un index au dataframe
+transactions$transaction_id <- seq.int(nrow(transactions))
+#transactions$date <- str_split(transactions$date, "\\.")
+transactions$date = as.POSIXct(transactions$date, format = "%Y-%m-%d %H:%M:%S", tz = "CET")
+df_status(transactions)
+
+```
+
+On note que 43 dates n'ont pas pu être converties : on recherche l'erreur.
+
+```{r}
+
+# Identification des lignes dont les dates se convertissent en NA
+transactions_date_na = transactions |> filter(is.na(date))
+id_dates_na = transactions_date_na$transaction_id
+
+#Réimport du fichier d'origine
+transactions_2 <- read.csv("Ressources/data/transactions.csv", sep = ";") |> filter(id_prod != '')
+transactions_2$transaction_id <- seq.int(nrow(transactions_2))
+
+#Filtre sur les dates problématiques et affichage
+transactions_2 |> filter(transaction_id %in% id_dates_na)
+
+```
+
+Les dates non trouvées correspondent au passage à l'heure d'été du 27/03/2022 (les datetimes entre 2 et 3 heures du matin d'existent pas en CET). On remplace par la même date à 3 heures du matin
+
+```{r}
+# Définition du nouveau datetime
+dt = "2022-03-27 03:00:00"
+dt = as.POSIXct(dt, format = "%Y-%m-%d %H:%M:%S", tz = "CET")
+#remplacement des NA par le datetime
+transactions$date[is.na(transactions$date)] <- dt
+summary(transactions)
+rm(id_dates_na)
+rm(transactions_date_na)
+rm(transactions_2)
+
+rm(dt)
+```
+
+Nous disposons donc d'une table des transactions avec l'id transaction (clé unique), l'id produit, la date de transaction au format POSIXct, l'id client et l'id de la session d'achat.
+
+## Fusion des tables
+
+On réalise des calculs préparatoire en amont de la fusion des tables, qui seront utiles dans l'analyse des données
+
+```{r}
+# Ajout de l'âge dans la table des clients et des tranches d'âge pertinentes selon les nuages de points observés
+customers$age = 2024 - customers$birth
+break_labels = c("moins de 33 ans", "de 34 à 53 ans", "plus de 54 ans")
+customers$tranche_age = cut(customers$age, breaks = c(min(customers$age),33,53,max(customers$age)),
+                            labels = break_labels, include.lowest = TRUE)
+rm(break_labels)
+
+# Ajout des colonnes jour et mois à la table des transactions
+transactions$day = as.Date(transactions$date, tz = 'CET')
+transactions$month = as.yearmon(transactions$day)
+```
+
+```{r}
+# fusion des tables
+transactions <- merge(transactions,customers, by="client_id")
+transactions <- merge(transactions,products, by="id_prod")
+```
+
+```{r}
+# Ajout du nombre et du montant total des achats par clients dans la table customers + âge, fréquence d'achat, panier moyen
+sales_customers = transactions %>%
+  group_by(client_id) %>%
+  summarise(sales = sum(price), sale_number = n(), transactions = n_distinct((session_id)),
+            cat0 = sum(categ == 0), cat1 = sum (categ == 1), cat2 = sum(categ == 2)) %>%
+  arrange(sales)
+customers = merge(customers, sales_customers, on = 'client_id')
+rm(sales_customers)
+# On ne garde dans la table "customers" que les clients ayant réalisé des achats
+
+# Ajout pour chaque client de la fréquence d'achat par mois, du prix moyen des produits achetés, 
+# du panier moyen en nombre de produits et en euros
+customers$month_freq = customers$transactions/24
+customers$average_price = customers$sales/customers$sale_number
+customers$average_number = customers$sale_number/customers$transactions
+customers$average_basket = customers$sales/customers$transactions
+```
+
+# Objectifs de l'analyse
+
+On cherche dans cette étude à analyser : \* l'évolution dans le temps des données des ventes \* le top et le flop des ventes \* la répartition par catégorie des ventes \* le profil des clients \* les corrélations entre le profil des clients et leurs pratiques d'achat
+
+# Calculs préparatoires à l'analyse des données
+
+## Aggrégation des données
+
+```{r}
+
+# Ajout des données nombre de ventes (sale_number) et chiffre d'affaires (sales) dans la table products
+products_transactions = transactions %>%
+  group_by(id_prod) %>%
+  summarise(sales = sum(price), sale_number = n())
+products = merge(products, products_transactions, on = 'id_prod', all = TRUE)
+products$sales <- na.fill(products$sales, fill = 0)
+products$sale_number <- na.fill(products$sale_number, fill = 0)
+rm(products_transactions)
+
+# Création d'une table des transactions récapitulant les ventes par session
+sessions = transactions %>%
+  group_by(session_id) %>%
+  summarise(sales = sum(price), sale_number = n(), client = first(client_id)) %>%
+  arrange(sales)
+
+# Création d'une table des transactions par jour
+day_transactions = transactions %>%
+  group_by(day) %>%
+  summarise(sale_number = n(), transactions = n_distinct(session_id), sales = sum(price), customers = n_distinct(client_id))
+
+# Vérification que tous les jours sont renseignés dans day_transactions
+v1 = day_transactions$day[-1]
+v2 = day_transactions$day[- which.max(day_transactions$day)]
+sum(v2 + 1 != v1) # 0 ok
+rm(v1,v2)
+
+# Création d'une table des transactions par mois
+month_transactions = transactions %>%
+  group_by(month) %>%
+  summarise(sale_number = n(), transactions = n_distinct(session_id), sales = sum(price), customers = n_distinct(client_id), 
+            products = n_distinct(id_prod))
+
+# Création d'une table récapitulant les données de vente par catégorie de produit
+categ_transactions = transactions %>%
+  group_by(categ) %>%
+  summarise(sale_number = n(), sales = sum(price), customers = n_distinct(client_id), products = n_distinct(id_prod))
+
+# Création d'une table récapitulant les données des ventes par catégorie et par mois
+month_categ = transactions %>%
+  group_by(month, categ) %>%
+  summarise(sale_number = n(), sales = sum(price), customers = n_distinct(client_id), 
+            products = n_distinct(id_prod))
+
+```
+
+## Dissociation des données B to B et B to C
+
+On voit dans la suite de l'analyse 4 gros clients particuliers : on dissocie immédiatemment les données entre ces clients "B to B" et les autres clients, "B to C"
+
+```{r}
+
+# Création d'une table avec les clients B to C (gros clients ~ 100 000 € de CA)
+customers_c = customers %>% filter(customers$sales < 10000)
+customers_b = customers %>% filter(customers$sales > 10000)
+
+# transactions B to C et résumé quotidien
+transactions_c = transactions %>% filter(client_id %in% customers_c$client_id)
+day_transactions_c = transactions_c %>%
+  group_by(day) %>%
+  summarise(sold_products = n(), transactions = n_distinct(session_id), sales= sum(price), customers = n_distinct(client_id))
+
+# transactions B to B et résumé quotidien
+transactions_b = transactions %>% filter(!client_id %in% customers_c$client_id)
+day_transactions_b = transactions_b %>%
+  group_by(day) %>%
+  summarise(sold_products = n(), transactions = n_distinct(session_id), sales= sum(price), customers = n_distinct(client_id))
+
+# Nombre de transactions B to C
+total_sale_number_c = nrow(transactions_c)
+
+# Nombre de clients B to C
+total_customers_c = nrow(customers_c)
+```
+
+# Analyse de la typologie des produits, des ventes et des clients
+
+## Produits
+
+### Réparition des prix par catégorie
+
+```{r}
+# Définition des couleurs des catégories
+colors = c("goldenrod3", "deeppink4", "darkcyan")
+```
+
+```{r}
+# Affichage sous forme de diagramme en violons avec boxplot
+ggplot(data = products, mapping = aes(x = categ, y = price, fill =categ))+
+  labs(title = "Répartition du prix des produits par catégorie", 
+       x = element_blank(), 
+       y = "Prix (€)")+
+  geom_violin(bw = 4) + 
+  geom_boxplot(width = 0.04, outliers = FALSE)+
+  scale_fill_manual(values = colors, name = "Catégorie")+
+  theme(axis.text = element_text(size = 12),
+        legend.position = c(0.1,0.75),
+        legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "grey30"),
+        panel.grid.major = element_line(color = "white", size = 1, linetype = "dashed"),
+        panel.grid.minor = element_line(color = "white", size = 0.5, linetype = "dashed"),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank())
+```
+
+### Réparition des références de produit par catégorie
+
+```{r}
+
+ggplot(products, aes(x = categ, fill = categ)) +
+  geom_bar(width = 0.5, stat = "count") +
+  labs(x = "Catégorie", y = "Nombre de produits") +
+  scale_fill_manual(values = colors) +
+  theme(axis.title.y = element_text(vjust = 4))
+
+ggplot(transactions, aes(x = categ, fill = categ))+
+  geom_bar(stat = "count", position = "dodge", width = 0.5)+
+  labs(x = "Catégorie", y = "Nombre de produits vendus")+
+  scale_y_continuous(labels = function(x) format(x, scientific = FALSE, big.mark = " ")) +
+  scale_fill_manual(values = colors)+
+  theme(axis.title.y = element_text(vjust = 4))
+
+legende = paste("Catégorie", categ_transactions$categ,":",round(100*categ_transactions$products/sum(categ_transactions$products)),"%")
+  
+ggplot(categ_transactions)+
+  geom_bar(mapping = aes(x = 1, y = products, fill = categ), stat = "identity", color="white", width = 1)+
+  labs(title = "Répartition par catégorie des produits du catalogue", x = "Catégorie", y = "Nombre de produits vendus", fill = element_blank())+
+  scale_fill_manual(values = colors, labels = legende)+
+  coord_polar("y") +  
+  theme_void()+
+  theme(legend.text = element_text(size = 15), plot.title=element_text(size=18,face="bold"))
+rm(legende)
+
+legende = paste("Catégorie", categ_transactions$categ,":",round(100*categ_transactions$sale_number/sum(categ_transactions$sale_number)),"%")
+ggplot(categ_transactions)+
+  geom_bar(mapping = aes(x = 1, y = sale_number, fill = categ), stat = "identity", color="white", width = 1)+
+  labs(title = "Répartition des ventes par catégorie", x = "Catégorie", y = "Nombre de produits vendus", fill = element_blank())+
+  scale_fill_manual(values = colors, labels = legende)+
+  coord_polar("y") +  
+  theme_void()+
+  theme(legend.text = element_text(size = 15), plot.title=element_text(size=20,face="bold"))
+
+rm(legende)
+```
+
+### Top produits en nombre de ventes
+
+On définit ici le Top des ventes par le 10ème décile des produits en nombre de ventes sur les 2 ans
+
+```{r}
+
+# Top constitué du 10ème décile des produits en nombre de ventes
+c = quantile(products$sale_number, 0.9)[[1]]
+top_produits = products %>%   filter(sale_number >= c)
+rm(c)
+
+# Histogramme de répartition par nombre de ventes
+ggplot(top_produits,aes(x = sale_number, fill = categ))+
+  geom_histogram(binwidth=50)+
+  labs(title = "Répartition entre catégories des produits du Top", 
+       x = "Nombre de ventes", y = "Nombre de produits")+
+  # scale_x_continuous(n.breaks = c)+
+  scale_fill_manual(values = colors, name = "Catégorie")+
+  scale_x_continuous(breaks = seq(0,3000, by = 200))+
+  theme(axis.text = element_text(size = 12),
+        legend.position = c(0.9,0.75),
+        legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "black"))
+
+
+# Histogramme de répartition par prix
+m1 = median(top_produits$price)
+ggplot(top_produits,aes(x = price, fill = categ))+
+  geom_histogram(binwidth=2)+
+  labs(title = "Répartition par prix et par catégorie des produits du Top ", 
+       x = "Prix de vente (€)", y = "Nombre de produits")+
+  geom_vline(xintercept = median(top_produits$price),  # Specify the x-coordinate of the line (mean)
+             color = "grey30",  size = 1) + 
+  scale_fill_manual(values = colors, name = "Catégorie")+
+  annotate(x= m1,y=+Inf,label=paste("Médiane",":",round(m1),'€'),vjust=2,geom="label") # médiane
+rm(m1)
+
+# diagramme circulaire de la répartition
+ggplot(top_produits)+
+  geom_histogram(mapping = aes(x = 1, fill = categ), stat = "count", color="white")+
+  labs(title = "Répartition des produits du Top entre catégories", x = "Catégorie", y = "Nombre de produits vendus")+
+  scale_fill_manual(values = colors)+
+  coord_polar("y") +  
+  theme_void()
+```
+
+On constate que :
+
+-   le Top est constitué uniquement par des produits de catégorie 1 à partir de 1300 ventes.
+
+-   La catégorie 0 est cependant bien représentée en-deçà de de seuil.
+
+-   La catégorie 2 apparaît marginalement dans le Top.
+
+On réalise un zoom sur les références du Top 10
+
+```{r}
+# Affichage du Top 10 en nombre de ventes
+
+top10 = head(arrange(top_produits, by = desc(sale_number)),10) 
+top10$sales = round(top10$sales)
+names = c("Nombre de ventes", "Id produit", "Prix (€)", "Catégorie", "Chiffre d'affaires (€)")
+top10 = setNames(top10 %>% select(sale_number, id_prod, price, categ, sales) , names)
+top10
+rm(names)
+```
+
+### Flop produits en nombre de ventes
+
+On définit ici le Flop des ventes par le 1er décile des produits en nombre de ventes sur les 2 ans
+
+```{r}
+
+# Flop constitué du 1er décile des produits en nombre de ventes
+c = quantile(products$sale_number, 0.1)[[1]]
+flop_produits = products %>%   filter(sale_number <= c)
+
+# Histogramme du nombre de produits par nombre de ventes et par catégorie 
+m2 = median(flop_produits$price)
+ggplot(flop_produits,aes(x = price, fill = categ))+
+  geom_histogram()+
+  geom_vline(xintercept = mean(flop_produits$price),  # Specify the x-coordinate of the line (mean)
+             color = "grey19",  size = 1) + 
+  labs(title = "Répartition des prix des produits du Flop 20", 
+       x = "Prix de vente (€)", y = "Nombre de produits")+
+  scale_x_continuous(n.breaks = 15)+
+  scale_fill_manual(values = colors, name = "Catégorie")+
+  annotate(x= m2,y=+Inf,label=paste("Médiane",":",round(m2),'€'),vjust=2,geom="label")
+rm(m2)
+
+# Diagramme barre du nombre de produits par nombre de ventes et par catégorie 
+ggplot(flop_produits,aes(x = sale_number, fill = categ))+
+  geom_bar(stat = "count", width = 0.5)+
+  labs(title = "Répartition entre catégories des produits du Flop", 
+       x = "Nombre de ventes", y = "Nombre de produits")+
+  scale_x_continuous(n.breaks = c)+
+  scale_fill_manual(values = colors, name = "Catégorie")+
+  scale_y_continuous(breaks = seq(0,60, by = 10), minor_breaks = seq(0,60, by = 10))+
+  theme(axis.text = element_text(size = 12),
+        legend.position = c(0.1,0.8),
+        legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "black"),
+        panel.grid.major = element_line(color = "white", size = 0.5, linetype = 1),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank())
+
+
+# diagramme circulaire de la répartition
+ggplot(flop_produits)+
+  geom_histogram(mapping = aes(x = 1, fill = categ), stat = "count", color="white", width = 1)+
+  labs(title = "Répartition des produits du Flop entre catégories", x = "Catégorie", y = "Nombre de produits vendus")+
+  scale_fill_manual(values = colors)+
+  coord_polar("y") +  
+  theme_void()
+
+rm(c)
+
+```
+
+on constate une nette sur-représentation de la catégorie 0, et dans une moindre mesure de la catégorie 2
+
+```{r}
+# Affichage du Flop 10 en nombre de ventes
+
+flop10 = head(arrange(flop_produits, by = sale_number),21) 
+flop10$sales = round(flop10$sales)
+names = c("Nombre de ventes", "Id produit", "Prix (€)", "Catégorie", "Chiffre d'affaires (€)")
+flop10 = setNames(flop10 %>% select(sale_number, id_prod, price, categ, sales) , names)
+flop10
+rm(names)
+```
+
+## Clients
+
+### Répartition du chiffre d'affaire entre clients
+
+On trace tout d'abord la courbe de Lorenz et on calcule l'indice de Gini de la répartition du chiffre d'affaires entre clients
+
+```{r}
+ggplot(customers, aes(x = sales, fill = "a")) +
+  stat_lorenz(geom = "polygon", alpha = 0.3) +
+  stat_lorenz(color = "seagreen", size = 1) +
+  geom_abline(linetype = "dashed") +
+  coord_fixed() +
+  scale_fill_hue() +
+  theme(legend.position = "none") +
+  labs(x = "Part cumulée des clients",
+       y = "Part cumulée du chiffre d'affaires",
+       title = "Courbe de Lorenz de répartition du chiffre d'affaires entre clients")+
+    scale_fill_manual(values = c("seagreen"))
+
+cat('\n\nIndice de Gini : \n')
+Gini(customers$sales)
+```
+
+On observe sur la partie haute de la courbe un applatissement montrant un chiffre d’affaires important pour quelques clients L'indice de Gini de 0, 44 indique épartition modérément inégale du chiffre d’affaires entre clients
+
+```{r}
+# liste des clients triés par chiffre d'affaires décroissant
+head(arrange(customers,desc(sales)),10)
+```
+
+On identifie 4 clients sur les 8600 clients actifs qui ont réalisé plus 100 000 euros d'achat chacun en 2 ans Les achats des autres clients sont tous inérieurs à 6 000 €. Ces 4 clients pèsent donc lourd dans le chiffre d'affaires du commerce.
+
+```{r}
+paste('Part des ventes des clients B to B : ', round(100*sum(customers_b$sales)/sum(customers$sales)), '%')
+```
+
+### Répartition âge et montant des achats
+
+```{r}
+
+ggplot(customers_c)+
+  geom_density(mapping = aes(x = sales))+
+  ggtitle ('répartition du montant total des achats des clients')
+
+ggplot(customers)+
+  geom_density(mapping = aes(x = age))+
+  ggtitle ("répartition de l'âge des clients")
+
+```
+
+### Analyse des clients B to B
+
+On s'intéresse à la typologie des achats des clients, en observant ici la catégorie des leurs achats
+
+```{r}
+
+# Création de la table des données à afficher
+data = subset(customers_b, select = c(client_id, cat0, cat1, cat2))
+data = pivot_longer(data = data, cols = c( "cat0", "cat1", "cat2",), 
+                  names_to = "categ", values_to = "sale_number")
+
+# Diagramme barre du nombre de produits par client B to B et par catégorie 
+ggplot(data, mapping = aes(x = client_id, y = sale_number, fill = categ))+
+  geom_bar(stat = "identity", width = 0.5)+
+  labs(title = "Nombre de ventes par catégorie et par client B to B", 
+       x = "Client", y = "Nombre de produits achetés sur 2 ans")+
+  scale_fill_manual(values = colors, name = "Catégorie")+
+  scale_y_continuous(labels = function(x) format(x, scientific = FALSE, big.mark = " "))
+
+
+# Diagramme barre du chiffres d'affaires par client B to B et par catégorie
+data = transactions_b %>% 
+  group_by(client_id,categ) %>% 
+  summarise(sales = sum(price), sale_number = n())
+
+data = arrange(data, by = desc(sales))
+ggplot(data, mapping = aes(x = reorder(client_id, -sales), y = sales, fill = categ))+
+  geom_bar(stat = "identity", width = 0.5)+
+  labs(title = "Chiffre d'affaires par catégorie et pour chaque client B to B", 
+       x = "Client", y = "Chiffre d'affaires sur 2 ans")+
+  scale_fill_manual(values = colors, name = "Catégorie")+
+  scale_y_continuous(labels = function(x) format(x, scientific = FALSE, big.mark = " "))+
+  theme(axis.text = element_text(size = 12),
+        legend.position = c(0.9,0.8),
+        legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "grey30"),
+        panel.grid.major = element_line(color = "white", size = 1, linetype = "dashed"),
+        panel.grid.minor = element_line(color = "white", size = 0.5, linetype = "dashed"),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank())
+
+rm(data)
+```
+
+On constate que les clients B to B ont des typologie d'achat très différentes en termes de catégories de livres. Cette différence est probablement liée à leur activité propre, ou à leur politique d'achat.
+
+# Evolution des ventes sur deux ans
+
+On s'intérese maintenant aux évolutions des chiffres de ventes sur les 2 années pour lesquelles nous avons les données.
+
+## Evolution du chiffre d'affaires par jour
+
+```{r}
+# Préparation des éléments visuels pour l'affichage
+
+# Définition des dates de la série de transactions pour l'affichage
+d1 = as.Date(min(transactions$day))
+d2 = as.Date(max(transactions$day))
+datebreaks_months = seq(d1, d2, by="1 month")
+datebreaks_years = c(as.Date("2022-01-01"), as.Date("2023-01-01"))
+
+# Définition du thème d'affichage des séries temporelles
+theme_timeline = theme(axis.text.x = element_text(angle=90, hjust=1, vjust = 0.2),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        panel.grid.major.y = element_line(color = "grey", size = 0.5, linetype = 1),
+        panel.grid.minor.y = element_line(color = "grey", size = 0.5, linetype = 3),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.x = element_line(color = "grey", size = 0.5, linetype = 3),
+        legend.text = element_text(size = 12))
+```
+
+On visualise d'abord le chiffre d'affaires par jour sans traitement.
+
+```{r}
+ggplot(data = day_transactions, mapping = aes(x = day))+
+  labs(title = "Evolution du chiffre d'affaires", x= "Date", y = "Chiffre d'affaires par jour") +
+  geom_line(aes(y = sales), colour="seagreen")+
+  scale_x_date(breaks = datebreaks_months, date_labels = "%e %b %Y")+
+  theme_classic()+
+  theme_timeline
+```
+
+La série temporelle subit beaucoup de bruit ce qui complique sa lecture. On réalise donc un lissage par moyenne mobile. On teste tout d'abord une moyenne mobile sur 1 semaine, qui pourrait correspondre à une saisonnalité naturelle.
+
+### Moyenne mobile sur 1 semaine
+
+```{r}
+# Moyenne mobile sur une semaine et moyenne mobile double
+day_transactions$sales_rollmean_7 = rollmean(day_transactions$sales, 7, fill=NA)
+day_transactions$sales_rollmean_7_2 = rollmean(day_transactions$sales_rollmean_7,7, fill = NA)
+
+# Affichage du chiffre d'affaire selon différents traitement sur 7 jours
+plot(day_transactions$day, day_transactions$sales, main = "Chiffre d'affaires par jour non lissé", type = "l")
+plot(day_transactions$day, day_transactions$sales_rollmean_7, xlab = "jour", main = "moyenne mobile du CA sur 7 jours", type = "l")
+plot(day_transactions$day, day_transactions$sales_rollmean_7_2, xlab = "jour", main = "moyenne mobile*2 du CA sur 7 jours", type = "l")
+
+ggplot(data = day_transactions, mapping = aes(x = day))+
+  ggtitle("Chiffre d'affaires en moyenne mobile double sur 7 jours") +
+  geom_smooth(aes(y = sales), method = "lm", level=0, colour = "seagreen", linetype = "dashed")+
+  geom_line(aes(y = sales_rollmean_7_2), colour="seagreen", linewidth = 1)+
+  scale_x_date(breaks = datebreaks_months, date_labels = "%d %b %Y")+
+  theme_classic()+
+  theme_timeline
+
+```
+
+On observe encore beaucoup de bruit en moyenen mobile double sur une période de 7 jours : on passe en moyenne mobile sur 1 mois pour mieux isoler les pertubations les plus importantes
+
+### Moyenne mobile sur 1 mois
+
+```{r}
+# Moyenne mobile simple et double sur un mois 
+day_transactions$sales_rollmean_30 = rollmean(day_transactions$sales, 30, fill=NA)
+day_transactions$sales_rollmean_30_2 = rollmean(day_transactions$sales_rollmean_30,30, fill = NA)
+
+# Affichage du chiffre d'affaire selon différents traitement sur 30 jours
+plot(day_transactions$day, day_transactions$sales, main = "Chiffre d'affaires par jour non lissé", type = "l")
+plot(day_transactions$day, day_transactions$sales_rollmean_30, xlab = "jour", main = "moyenne mobile du CA sur 30 jours", type = "l")
+plot(day_transactions$day, day_transactions$sales_rollmean_30_2, xlab = "jour", main = "moyenne mobile*2 du CA sur 30 jours", type = "l")
+
+
+ggplot(data = day_transactions, mapping = aes(x = day))+
+  labs(title = "Evolution du chiffre d'affaires par jour : moyenne mobile double sur 30 jours", 
+       x = "Date", 
+       y = "Chiffre d'affaires (€)")+
+  #geom_line(aes(y = sales), colour="gray47")+
+  #geom_line(aes(y = sales_rollmean_30), colour="red3")+
+  geom_smooth(aes(y = sales), method = "lm", level=0, colour = "seagreen", linetype = "dashed")+
+  geom_vline(xintercept = datebreaks_years, color = "grey",  size = 0.5)+
+  geom_line(aes(y = sales_rollmean_30_2), colour="seagreen", linewidth = 1)+
+  scale_x_date(breaks = datebreaks_months, date_labels = "%e %b %Y")+
+  scale_y_continuous(labels = function(x) format(x, big.mark = " ")) +
+  theme_classic()+
+  theme_timeline
+
+```
+
+Ce traitement aplatit les pics de pertubations mais met en évidence un plateau net en 2022, et un plateau moins net début 2021
+
+On note de fortes perturbations de juin 2021 à avril 2022. Les causes peuvent être multiples : Loi Darcos au 7/10/2021 (mise en place de frais de port minimaux pour les livres neufs), évolution du catalogue, du site internet, des pratiques d’achat ...
+
+On note : \* Une stabilisation en 2022 du chiffre d’affaires à 16 500 €/jour \* Une hausse du chiffre d’affaires de l’ordre de 4 % sur 2 ans (de 15 800 à 16 500 €/jour)
+
+### Chiffres d'affaires B to B et B to C
+
+On cherche à identifier si les clients B to B ont un rôle dans les pertubations observées en décomposant le chiffre d'affaires entre clients B to B et B to C.
+
+```{r}
+# Moyenne mobile sur une semaine et moyenne mobile double
+day_transactions_c$sales_rollmean_7 = rollmean(day_transactions_c$sales, 7, fill=NA)
+day_transactions_c$sales_rollmean_7_2 = rollmean(day_transactions_c$sales_rollmean_7,7, fill = NA)
+day_transactions_b$sales_rollmean_7 = rollmean(day_transactions_b$sales, 7, fill=NA)
+day_transactions_b$sales_rollmean_7_2 = rollmean(day_transactions_b$sales_rollmean_7,7, fill = NA)
+
+ggplot()+
+  labs(title = "Chiffre d'affaires (moyenne mobile double sur 7 jours) pour les clients B to B et B to C", 
+  x = "date", y = "chiffres d'affaires par jour (€)") +
+  geom_line(data = day_transactions_c, mapping = aes(x = day, sales_rollmean_7_2, color = "B to C"), size = 1)+
+  geom_line(data = day_transactions_b, mapping = aes(x = day, sales_rollmean_7_2, color = "B to B"), size = 1)+
+  scale_x_date(breaks = datebreaks_months, date_labels = "%e %b %Y")+
+  scale_color_manual(values = c("B to C" = "seagreen", "B to B" = "royalblue"), name = "Chiffre d'affaires")+
+  theme_classic()+
+  theme_timeline
+
+```
+
+Les perturbations ne peuvent manifestement pas être expliquées par les variations des pratiques d'achat de nos quelques gros clients. Les ventes des clients B to B connaissent en outre les mêmes perturbations que les ventes des autres clients.
+
+### Recherche d'une saisonnalité
+
+Nous allons rechercher une saisonnalité dans les ventes en testant des périodes naturelles : 7 jours, 15 jours et 30 jours.
+
+```{r}
+# Décomposition par quinzaine du CA en moyenne mobile double 7 jours
+ts_sales_15 = ts(day_transactions$sales, frequency = 15)
+ts_sales_15.decomp = decompose(ts_sales_15, type = "additive")
+plot(ts_sales_15.decomp)
+```
+
+```{r}
+# Décomposition du CA avec période une semaine
+ts_sales_7 = ts(day_transactions$sales, frequency = 7)
+ts_sales_7.decomp = decompose(ts_sales_7, type = "additive")
+plot(ts_sales_7.decomp)
+```
+
+```{r}
+
+# Décomposition du CA avec période un mois
+ts_sales_30 = ts(day_transactions$sales, frequency = 30)
+ts_sales_30.decomp = decompose(ts_sales_30, type = "additive")
+plot(ts_sales_30.decomp)
+```
+
+Dans les 3 décompositions, le bruit est très supérieur à l'amplitude du signal saisonnier calculé : on conclut à l'absence de saisonnalité
+
+### Evolution du chiffre d'affaires par catégorie
+
+```{r}
+# Préparation des données de CA par catégorie et par joru
+day_categ_transactions = transactions %>%
+  group_by(day, categ) %>%
+  summarise(sales = sum(price))
+sales_day = pivot_wider(day_categ_transactions, names_from = categ, values_from = sales, names_prefix = "categorie_")
+
+# Passage en moyenne mobile doubles du chiffre d'affaires de chaque catégorie
+sales_day$rm30_0 = rollmean(sales_day$categorie_0, 30, fill = NA)
+sales_day$rm30_0 = rollmean(sales_day$rm30_0, 30, fill = NA)
+sales_day$rm30_1 = rollmean(sales_day$categorie_1, 30, fill = NA)
+sales_day$rm30_1 = rollmean(sales_day$rm30_1, 30, fill = NA)
+sales_day$rm30_2 = rollmean(sales_day$categorie_2, 30, fill = NA)
+sales_day$rm30_2 = rollmean(sales_day$rm30_2, 30, fill = NA)
+
+
+# Affichage de l'évolution du CA par catégorie
+ggplot(data = sales_day, mapping = aes(x= day))+
+  labs(title = "Evolution du chiffre d'affaires quotidien par catégorie : (moyenne mobile double sur 30 jours)", 
+       x = "Date", 
+       y = "Chiffre d'affaires (€)")+  
+  geom_line(mapping = aes(y = rm30_0, color="catégorie 0"), size = 1)+
+  geom_line(mapping = aes(y = rm30_1, color="catégorie 1"), size = 1)+
+  geom_line(mapping = aes(y = rm30_2, color="catégorie 2"), size = 1)+
+  geom_vline(xintercept = datebreaks_years, color = "grey",  size = 0.5)+
+  scale_x_date(breaks = datebreaks_months, date_labels = "%e %b %Y")+
+  scale_y_continuous(labels = function(y) format(y, big.mark = " ")) +
+  scale_color_manual(values = c("catégorie 0" = colors[[1]], 
+                "catégorie 1" = colors[[2]], "catégorie 2" = colors[[3]]), name = "Catégorie")+
+  theme_classic()+
+  theme_timeline+
+  theme(legend.position = c(0.75,0.1),
+        legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "grey30"),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 12),
+        legend.direction = "horizontal")
+
+
+# Affichage de la répartition du CA mensuel par catégorie
+months = month_transactions$month
+ggplot(data = month_categ, mapping = aes(x = month, y = sales, fill = categ))+
+  geom_bar(stat = "identity", position = "stack") + #voir dodge pour séparer
+  theme_minimal() +
+  labs(title = "Chiffre d'affaires par mois", x = "Mois", y = "Chiffre d'affaires (€)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+  # Rotation des labels pour lisibilité
+  scale_fill_manual(values = colors, name = "Catégorie")
+```
+
+On observe des pertubations sur la même période que le chiffre d'affaires total : cependant les courbes par catégorie suivent des tendances très différentes voire opposées.
+
+Elles se stabilisent toutes en 2022 avec les chiffes d'affaires suivants :
+
+-   Catégorie 0 : 6 000 €/jour
+
+-   Catégorie 1 : 6 300 €/jour
+
+-   Catégorie 2 : 4 000 €/jour
+
+## Evolution des chiffres de ventes
+
+### Evolution du nombre de ventes et du nombre de transactions
+
+```{r}
+# Passage en moyenne mobile doubles du nombre de ventes et de tansactions par jour
+day_transactions$sale_number_rm_30 = rollmean(day_transactions$sale_number, 30, fill = NA)
+day_transactions$sale_number_rm_30 = rollmean(day_transactions$sale_number_rm_30, 30, fill = NA)
+day_transactions$transactions_rm_30 = rollmean(day_transactions$transactions, 30, fill = NA)
+day_transactions$transactions_rm_30 = rollmean(day_transactions$transactions_rm_30, 30, fill = NA)
+
+# Affichage des données
+ggplot(data = day_transactions, mapping = aes(x= day))+
+  labs(title = "Evolution du nombre de transactions et de ventes par jour", x = "Date") +
+  geom_line(mapping = aes(y = sale_number_rm_30, color="Nombre de produits vendus par jour"), size = 1)+
+  geom_line(mapping = aes(y = transactions_rm_30*2, color="Nombre de transactions par jour"), size = 1)+
+  geom_vline(xintercept = datebreaks_years, color = "gray",  size = 0.5)+
+  scale_x_date(breaks = datebreaks_months, date_labels = "%e %b %y")+
+  scale_y_continuous(name = "Nombre de produits vendus par jour",
+                     sec.axis = sec_axis(~ . / 2, name = "Nombre de transactions par jour"))+
+  scale_color_manual(values = c("Nombre de produits vendus par jour" = "royalblue", 
+                "Nombre de transactions par jour" = "seagreen"), name = "Légende")+
+  theme_classic()+
+  theme_timeline+
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle=90, hjust=1),
+        axis.text.y  = element_text(color = 'royalblue'),
+        axis.title.y = element_text(color='royalblue'),
+        axis.text.y.right =  element_text(color = 'seagreen'),
+        axis.title.y.right = element_text(color='seagreen'),
+        legend.position = c(0.8, 0.15),
+        legend.text = element_text(size = 12),
+        legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "grey30"))
+
+
+
+```
+
+On note les mêmes pertubations que celles déjà observées sur le chiffre d'affaire, avec une stabilisation en 2022 à :
+
+-   470 transactions par jour
+
+-   930 produits vendus par jour
+
+### Evolution des comportements d'achat
+
+On va observer l'évolution du prix moyen du produit, de la taille de panier moyen et du montant du panier moyen, toujours en moyenne mobile double sur un mois
+
+```{r}
+
+# Calcul de l'évolution du panier moyen en euros par jour en moyenne mobile double
+day_transactions$average_basket = day_transactions$sales/day_transactions$transactions
+day_transactions$average_basket_rm30 = rollmean(day_transactions$average_basket, 30, fill = NA)
+day_transactions$average_basket_rm30 = rollmean(day_transactions$average_basket_rm30, 30, fill = NA)
+
+# Calcul du prix moyen du produit vendu par jour en moyenne mobile double
+day_transactions$average_price = day_transactions$sales/day_transactions$sale_number
+day_transactions$average_price_rm30 = rollmean(day_transactions$average_price,30, fill = NA)
+day_transactions$average_price_rm30 = rollmean(day_transactions$average_price_rm30,30, fill = NA)
+
+# Calculde de la taille du panier moyen par jour en moyenne mobile double
+day_transactions$average_basket_number = day_transactions$sale_number/day_transactions$transactions
+day_transactions$average_basket_number_rm30 = rollmean(day_transactions$average_basket_number,30, fill = NA)
+day_transactions$average_basket_number_rm30 = rollmean(day_transactions$average_basket_number_rm30,30, fill = NA)
+
+
+ggplot(data = day_transactions, mapping = aes(x= day))+
+  labs(title = "Evolution du prix du produit vendu et de la taille de panier", x = "Date") +
+  geom_line(mapping = aes(y = average_price_rm30 *2, color="Prix moyen des produits achetés (€)"), size = 1)+
+  geom_line(mapping = aes(y = average_basket_number_rm30*20, color="Taille du panier moyen"), size = 1)+
+  geom_line(mapping = aes(y = average_basket_rm30, color="Montant du panier moyen (€)"), size = 1)+
+  geom_vline(xintercept = datebreaks_years, color = "grey",  size = 0.5)+
+  scale_x_date(breaks = datebreaks_months, date_labels = "%e %b %y")+
+  scale_y_continuous(name ="Prix moyen des produits achetés (€)", sec.axis = sec_axis(~ . / 20, name = "Taille du panier moyen"))+
+  theme_classic()+
+  scale_color_manual(values = c("Montant du panier moyen (€)" = "grey30",
+                                "Taille du panier moyen" = "seagreen", 
+                "Prix moyen des produits achetés (€)" = "royalblue"),
+                name = "Légende")+
+  theme_timeline+
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle=90, hjust=1),
+        axis.text.y  = element_text(color = 'royalblue'),
+        axis.title.y = element_text(color='royalblue'),
+        axis.text.y.right =  element_text(color = 'seagreen'),
+        axis.title.y.right = element_text(color='seagreen'),
+        legend.position = c(0.7,0.9),
+        legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "grey30"))
+
+```
+
+Les perturbations observées sur le chiffre d‘affaires s’observent également sur les comportements d’achat individuels : prix des produits achetés la taille du panier moyen Et donc montant du panier moyen
+
+Stabilisation en 2022 à :
+
+-   un panier moyen de 2 produits
+
+-   un prix moyen du produit de 35 €
+
+-   un panier moyen de 70 €
+
+### Evolution du nombre de ventes par catégorie
+
+```{r}
+# préparation des données de nombre de ventes par catégorie par jour
+day_categ = transactions %>%
+  group_by(day, categ) %>%
+  summarise(sales = sum(price), sale_number = n())
+sale_number_day = pivot_wider(day_categ, id_cols = day, names_from = categ, values_from = sale_number, names_prefix = "categorie_")
+
+# calcul des moyennes mobiles doubles
+sale_number_day$rm30_0 = rollmean(sale_number_day$categorie_0, 30, fill = NA)
+sale_number_day$rm30_0 = rollmean(sale_number_day$rm30_0, 30, fill = NA)
+sale_number_day$rm30_1 = rollmean(sale_number_day$categorie_1, 30, fill = NA)
+sale_number_day$rm30_1 = rollmean(sale_number_day$rm30_1, 30, fill = NA)
+sale_number_day$rm30_2 = rollmean(sale_number_day$categorie_2, 30, fill = NA)
+sale_number_day$rm30_2 = rollmean(sale_number_day$rm30_2, 30, fill = NA)
+
+# Affichage
+ggplot(data = sale_number_day, mapping = aes(x= day))+
+  ggtitle("Nombre de ventes par jour et par catégorie") +
+  geom_line(mapping = aes(y = rm30_0, color="catégorie 0"), size = 1)+
+  geom_line(mapping = aes(y = rm30_1, color="catégorie 1"), size = 1)+
+  geom_line(mapping = aes(y = rm30_2, color="catégorie 2"), size = 1)+
+  geom_vline(xintercept = datebreaks_years, color = "gray",  size = 0.5)+
+  scale_x_date(breaks = datebreaks_months, date_labels = "%b %y")+
+  scale_color_manual(values = c("catégorie 0" = colors[[1]], 
+                "catégorie 1" = colors[[2]], "catégorie 2" = colors[[3]]), name = "Catégorie")+
+  theme_classic()+
+  theme_timeline
+
+```
+
+### Nombre de clients par mois
+
+```{r}
+
+# Préparation des données de nombre de clients par mois
+customers_month = month_categ %>% select(month, categ, customers)
+customers_month = pivot_wider(customers_month, names_from = categ, values_from = customers, names_prefix = "categorie_")
+
+# Affichage du nombre de clients total par mois
+ggplot(data = month_transactions, mapping = aes(x = month))+
+  geom_line(mapping = aes(y= customers), color = "seagreen", size = 1) +
+  # geom_smooth(aes(y = customers), colour="blue", level=0)+
+  geom_vline(xintercept = as.yearmon(datebreaks_years), color = "gray",  size = 0.5)+
+  scale_x_yearmon(breaks = month_transactions$month)+
+  labs(title = "Nombre de clients par mois", x = "Mois", y = "Nombre de clients") +
+  theme_classic()+
+  theme_timeline
+
+# Affichage du nombre de clients par catégorie et par mois
+ggplot(data = customers_month, mapping = aes(x = month))+
+  labs(title = "Nombre de clients par mois pour chaque catégorie", x = "Mois", y = "Nombre de clients") +
+  geom_line(aes(y = categorie_0), colour=colors[[1]], size = 1)+
+  geom_line(aes(y = categorie_1), colour=colors[[2]], size = 1)+
+  geom_line(aes(y = categorie_2), colour=colors[[3]], size = 1)+
+  # geom_smooth(aes(y = categorie_0), colour="dodgerblue3", level=0)+
+  # geom_smooth(aes(y = categorie_1), colour="deeppink", level=0)+
+  # geom_smooth(aes(y = categorie_2), colour="springgreen4", level=0)+
+  scale_x_yearmon(breaks = customers_month$month)+
+  theme_classic()+
+  theme_timeline
+
+```
+
+# Analyse des corrélations
+
+Dans notre analyse de corrélation, nous utiliserons les tables transactions_c et customers_c qui ne contiennent pas les clients dis "B to B" qui ont réalisé plus de 100 000 € d'achats sur 2 ans, alors que les achats totaux des tous les autres clients se situent au-dessous de 5 000 €.
+
+Cela évitera que les résultats soient faussés par le comportement de ces 4 clients, que l'on peut considérer comme des outliers
+
+```{r}
+# Définition de la palette de couleurs pour les heatmaps
+hm_colors = colorRampPalette(c("white", "firebrick"))(50)
+```
+
+## Genre et catégories des livres achetés
+
+```{r}
+
+# Affichage du nombre de ventes par catégorie pour les hommes et pour les femmes
+ggplot(transactions_c %>%  group_by(sex), aes(fill = categ, x = sex))+
+  geom_bar(stat = "count", position = "fill", width = 0.5)+
+  labs(title = "Répartition des ventes par genre et par catégorie", x = element_blank(), y = "Part des ventes")+
+  scale_fill_manual(values = colors, name = "Catégorie")+
+  scale_x_discrete(labels = c("Femmes", "Hommes"))+
+  theme(axis.text.x = element_text(size = 12),
+        legend.text = element_text(size = 12),
+        panel.grid.major = element_line(color = "white", size = 1, linetype = "dashed"),
+        panel.grid.minor = element_line(color = "white", size = 0.5, linetype = "dashed"),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank())
+
+# Affichage du nombre de ventes par genre pour chaque catégorie
+ggplot(transactions_c %>%  group_by(sex), aes(x = categ, fill = sex))+
+  geom_bar(stat = "count", position = "fill", width = 0.5)+
+  labs(title = "Répatition des ventes par genre et par catégorie", x = element_blank(), y = "Part des ventes")+
+  scale_fill_manual(values = c("firebrick", "royalblue"), name = "Catégorie")+
+  theme(axis.text.x = element_text(size = 12))
+
+```
+
+On note que sur les deux graphiques que les ventes semblent réparties de la même manière pour les hommes et pour les femmes. Un test statistique nous permet de vérifier l'hypothèse d'indépendance des variables "genre" et "catégorie".
+
+### Table de contingence et test du Khi-2
+
+Les deux variables "genre" et "catégorie" sont qualitatives : on va donc construire une table de contingence et effectuer un test du Khi-2 pour vérifier leur indépendance.
+
+On teste :
+
+-   H0 : Les variables "genre" et "catégorie" sont indépendantes
+
+-   H1 : Les variables ne sont pas indépendantes
+
+```{r}
+# Calcul de la table de contingence cont_sex_categ 
+#représentant le nombre de produits achetés par sexe et par catégorie de livre
+sex_categ = transactions_c %>%
+  group_by(sex) %>%
+  summarise(cat0 = sum(categ == 0), cat1 = sum(categ == 1), cat2 = sum(categ == 2)) %>%
+  column_to_rownames("sex")
+
+# Table de contingence des effectifs théoriques sous H0
+sex_categ_th = tcrossprod(rowSums(sex_categ),colSums(sex_categ))/total_sale_number_c
+
+# Table des variations et calcul de khi_2
+measure = (sex_categ - sex_categ_th)^2/sex_categ_th
+khi_2 = sum(rowSums(measure))
+# Table des écarts à l'indépendance normalisée par la valeur khi-2
+corr = measure/khi_2 
+
+# Affichage des résultats
+
+cat("Valeur du khi-2 :")
+cat(khi_2)
+cat('\n')
+cat("Coefficient V de Cramer : ")
+cat(sqrt(khi_2/total_sale_number_c))
+cat('\n')
+
+# Heatmap de participation à la corrélation des variables
+pheatmap(corr, display_numbers = TRUE, number_color = "black", color = hm_colors,
+         fontsize = 10, fontsize_number = 12, fontsize_row=12, fontsize_col=12,
+         cluster_cols = FALSE, cluster_rows = FALSE,  
+         angle_col = 0, legend = FALSE,
+         main = "Carte de participation à la corrélation entre les variables 'Genre' et 'Catégorie'",
+         labels_col = c("Catégorie 0", "Catégorie 1", "Catégorie 2"),
+         labels_row = c("Femmes", "Hommes"))
+
+
+# Test du Khi 2
+# H0 : les variables aléatoires genre et catégorie sont indépendantes
+chisq.test(sex_categ)
+
+# Comparaison des effectifs des groupes réel et théorique
+sex_categ
+sex_categ - sex_categ_th
+total_sale_number_c
+
+rm(corr, measure, khi_2)
+```
+
+Le test du Khi-2 donne une p_valeur = 10\^-5 \<\< 0,05 ; on peut donc rejeter l'hypothèse H0 d'indépendance des variables "Genre" et "Catégorie".
+
+le coefficient V de Cramer est cependant égal à 0,006, ce qui correspond une corrélation très faible entre les 2 variables, comme observé graphiquement.
+
+La carte de chaleur montre :
+
+-   des variations non significatives entre genres dans les catégories 0 et 2
+
+-   une (légère) sur-représentation des femmes dans les ventes de catégorie 1
+
+## Age et catégories des livres achetés
+
+On visualise tout d'abord la répartition des âges par catégorie.
+
+```{r}
+
+# Diagramme de répartition des âges des clients par catégorie de livre acheté
+ggplot(data = transactions_c, mapping = aes(x = categ, y = age, fill = categ))+
+  labs(title = "Répartition selon l'âge des clients du nombre de produits achetés dans chaque catégorie", 
+       x = element_blank(), y = "Age (années)")+
+  geom_violin(bw = 3)+
+  geom_boxplot(width = 0.1, outliers = FALSE, linewidth = 1)+
+  scale_fill_manual(values = colors, name = "Catégorie") + 
+  scale_y_continuous(minor_breaks = seq(20,90, by = 10), breaks = seq(20,90, by = 10))+
+  theme(plot.title = element_text(size = 12), 
+        legend.text = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        legend.position = c(0.92,0.85),
+        legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "black"))
+
+```
+
+A première vue, les produits de la catégorie 2 semblent être très majoritairement achetés par les clients les plus jeunes. Les âges des catégorie 0 et 1 semblent suivre une répartition assez proche, avec une médiane de 45-50 ans, et cependant des âges plus étalés pour la catégorie 1.
+
+### Test de Kruskal-Wallis
+
+On réalise un test statistique pour statuer sur l'indépendance des variables "Genre" et "Catégorie". Une méthode est le test ANOVA, qui n'est valable que si les distributions suivent une loi normale, ont un effectif suffisant et des variances égales ou proches.
+
+```{r}
+# Comparaison des variances de chaque groupe
+a0 = (transactions |> filter(categ == 0))$age
+a1 = (transactions |> filter(categ == 1))$age
+a2 = (transactions |> filter(categ == 2))$age
+
+cat("Variance des prix groupés par catégorie de livre :")
+cat('\n Catégorie 0 :', var(a0))
+cat('\n Catégorie 1 :', var(a1))
+cat('\n Catégorie 2 :', var(a2))
+cat('\n\n\n')
+# Test de Kolmogorov-Smirnov pour tester l'adéquation des répartitions à des lois normales
+
+cat(" Tests d'adéquation de chaque distribution à des lois normales :", var(a2))
+ks.test(a0, "pnorm", mean(a0), sd(a0))
+ks.test(a1, "pnorm", mean(a1), sd(a1))
+ks.test(a2, "pnorm", mean(a2), sd(a2))
+
+rm(a0,a1,a2)
+```
+
+La condition d'égalité des variances n'est pas satisfaite, et les répartitions ne suivent pas de loi normale : on réalise donc un test de Kruskal-Wallis, qui est une ANOVA sur le rang des valeurs prises par nos variables.
+
+-   H0 : Les variables sont indépendantes
+-   H1 : Les variables ne sont pas indépendantes
+
+```{r}
+kruskal.test(age ~ categ, data = transactions_c)
+```
+
+La valeur du khi_2 est égale à 71 360, et la p-valeur \<\< 5% ; on rejette donc l'hypothèse d'indépendance des variables "Age" et "Catégorie".
+
+### Table de contingence et test du Khi-deux
+
+Analysons maintenant la répartition des effectifs en définissant des tranches d'âge.
+
+On visualise les données pour déceler une tendance selon les âges et choisir les seuils de discrétisation.
+
+```{r}
+
+# Nuages de points âge/achats par catégorie
+ggplot(customers_c)+
+  geom_point (mapping = aes(x = age, y = cat0), color = colors[[1]],alpha = 0.2)+
+  labs(title = "Nombre d'achats de chaque client par âge (catégorie 0)",
+       x = "Age", y = "Nombre d'achats")
+
+ggplot(customers_c)+
+  geom_point (mapping = aes(x = age, y = cat1), color = colors[[2]],alpha = 0.2)+
+  labs(title = "Nombre d'achats de chaque client par âge (catégorie 1)",
+       x = "Age", y = "Nombre d'achats")
+
+ggplot(customers_c)+
+  geom_point (mapping = aes(x = age, y = cat2), color = colors[[3]],alpha = 0.2)+
+  labs(title = "Nombre d'achats par client selon leur âge (catégorie 2)",
+       x = "Age", y = "Nombre d'achats")
+
+ggplot(customers_c)+
+  geom_point (mapping = aes(x = age, y = cat0), color = colors[[1]],alpha = 0.2)+
+  geom_point (mapping = aes(x = age, y = cat1), color = colors[[2]],alpha = 0.2)+
+  geom_point (mapping = aes(x = age, y = cat2), color = colors[[3]],alpha = 0.2)+
+  labs(title = "Nombre d'achats par client selon leur âge",
+       x = "Age", y = "Nombre d'achats")
+
+
+```
+
+On observe un rupture nette à 33 et 53 ans : on va donc pouvoir définir les 3 tranches d'âge suivantes :
+
+-   moins de 33 ans
+
+-   34 à 53 ans
+
+-   plus de 54 ans
+
+Grâce à cette discrétisation, nous créons une table de contingence entre nos variables, sur laquelle nous allons réaliser un test du Khi-2
+
+```{r}
+# Création de la table de contingence à partir de la table des clients hors B to B
+age_categ = customers_c %>%
+  group_by(tranche_age) %>%
+  summarise(cat0 = sum(cat0), cat1 = sum(cat1), cat2 = sum(cat2))%>%
+  column_to_rownames("tranche_age")
+# Inversion des ligne pour l'affichage de la heatmap
+age_categ = age_categ[order(nrow(age_categ):1),]
+# on vérifie ici que tous les effectifs sont supérieurs à 5
+
+# Table de contingence théorique
+age_categ_th = tcrossprod(rowSums(age_categ),colSums(age_categ))/total_sale_number_c
+
+# Table des variations et calcul de khi_2
+measure = (age_categ - age_categ_th)^2/age_categ_th
+khi_2 = sum(rowSums(measure))
+
+# Table des écarts à l'indépendance normalisée par la valeur khi-2
+corr = measure/khi_2
+
+# Affichage des résultats
+pheatmap(corr, display_numbers = TRUE, number_color = "black",
+         cluster_cols = FALSE, cluster_rows = FALSE, legend = FALSE,
+         angle_col = 0, color = hm_colors, 
+         fontsize = 8, fontsize_number = 12, fontsize_row=12, fontsize_col=12,
+         labels_col = c("Catégorie 0", "Catégorie 1", "Catégorie 2"),
+         main = 'Carte de chaleur de participation à la corrélation des variables "Age" et "Catégorie"')
+
+cat("Valeur du khi-2 :")
+cat(khi_2)
+cat('\n')
+cat("Coefficient V de Cramer : ")
+cat(sqrt(khi_2/(2*total_sale_number_c)))
+
+# Test du Khi-2 avec calcul de la p_valeur
+chisq.test(age_categ)
+
+# Différence d'effectifs entre observations et distributions indépendantes
+age_categ - age_categ_th
+
+rm(corr, measure, khi_2)
+```
+
+La table de contingence obtenue donne un coefficient V de Cramer = 0,43 ⇒ corrélation relativement marquée. La carte de chaleur nous indique que cette corrélation est principalement due à une forte présence des moins de 30 ans dans les achats de catégorie 2
+
+La catégorie 2, plus chère que les autres et donc constituée d’ouvrages particuliers, pourrait correspondre à des livres destinés aux étudiants, et/ou à des albums illustrés.
+
+## Age et montant total des achats
+
+On visualise en premier lieu les données grâce à un nuage de points
+
+```{r}
+# Nuage de points âge/montant des achats
+ggplot(customers_c, mapping = aes(x = age, y = sales))+
+  geom_point(color = 'seagreen',alpha = 0.2)+
+  #geom_smooth(color = "grey30", level = 0)+
+  labs(title = "Montant total des achats en fonction de l'âge des clients",
+       x = "Age", y = "Montant total des achats (€)")
+```
+
+Le graphique indique une tendance légèrement décroissante du montant des achats avec l'âge, mais pas de tendance linéaire. On va donc mesure la corrélation entre les variables par un coefficient de Spearman
+
+### Test de Spearman
+
+```{r}
+cat('Coefficient de Spearman : ')
+cor(customers$age,customers$sales, method="spearman")
+```
+
+Il confirme une faible corrélation négative entre les deux variables.
+
+### Test de Kruskal-Wallis
+
+On va tester l'indépendance des variables en discrétisant l'âge des clients selon les tranches d'âges déjà définies. Le seuil entre âges est cependant beaucoup moins net sur le montant des achats que sur la catégorie d'achat
+
+On visualise tout d'abord les données
+
+```{r}
+
+m1 = median((customers_c %>% filter(tranche_age == "moins de 33 ans"))$sales)
+m2 = median((customers_c %>% filter(tranche_age == "de 34 à 53 ans"))$sales)
+m3 = median((customers_c %>% filter(tranche_age == "plus de 54 ans"))$sales)
+
+ggplot(customers_c, mapping = aes(x = tranche_age, y = sales))+
+  geom_violin(fill = "lightyellow3") +
+  geom_boxplot(width = 0.1, outliers = FALSE)+
+  annotate(x= 0.6,y=+Inf,label=paste("Médiane :"),vjust=2,geom="label")+ # médiane
+  annotate(x= 1.2,y=+Inf,label=paste(round(m1),'€'),vjust=2,geom="label")+ # médiane
+  annotate(x= 2.2,y=+Inf,label=paste(round(m2),'€'),vjust=2,geom="label")+ # médiane
+  annotate(x= 3.2,y=+Inf,label=paste(round(m3),'€'),vjust=2,geom="label")+ # médiane
+  labs(title = "Montant total des achats en fonction de la tranche d'âge des clients",
+       x = "Tranche d'âge", y = "Montant total des achats sur 2 ans (€)")+
+  theme(axis.text = element_text(size = 12))
+
+rm(m1,m2,m3)
+```
+
+On vérifie que les groupes ne respectent pas les conditions d'un test ANOVA : égalité des variances et loi normale
+
+```{r}
+# Identification des 3 groupes étudiés
+a0 = (customers_c |> filter(tranche_age == "moins de 33 ans"))$sales
+a1 = (customers_c |> filter(tranche_age == "de 34 à 53 ans"))$sales
+a2 = (customers_c |> filter(tranche_age == "plus de 54 ans"))$sales
+
+# Comparaison des variances de chaque groupe
+cat("Variance du montant des achats groupés par tranche d'âge :")
+cat('\n Moins de 33 ans :', var(a0))
+cat('\n De 34 à 53 ans :', var(a1))
+cat('\n Plus de 54 ans :', var(a2))
+cat('\n\n\n')
+
+# Test de Kolmogorov-Smirnov pour tester l'adéquation des répartitions à des lois normales
+cat(" Tests d'adéquation de chaque distribution à une loi normale :")
+cat('\n\n\n')
+ks.test(a0, "pnorm", mean(a0), sd(a0))
+ks.test(a1, "pnorm", mean(a1), sd(a1))
+ks.test(a2, "pnorm", mean(a2), sd(a2))
+
+rm(a0,a1,a2)
+```
+
+On va donc tester l'indépendance des variable par un test de Kruskal-Wallis :
+
+-   H0 : Les variables sont indépendantes
+
+-   H1 : Les variables ne sont pas indépendantes
+
+```{r}
+kruskal.test(sales ~ tranche_age, data = customers_c)
+```
+
+p-value \< 2.2e-16 \<\< 5% ; on peut donc rejeter l'hypothèse d'indépendance des variables
+
+### Table de contingence et test du Khi-deux
+
+Pour réaliser notre table de contingence et la carte de chaleur des tendances d'association, nous discrétisons la variable "montant total des achats", en s'assurant que les effectifs de tous les groupes sont supérieurs à 5.
+
+```{r}
+
+# Création des tranches de fréquence dans une nouvelle colonne de customers_c
+breaks = c(0,1000,2000,ceiling(max(customers_c$sales)))
+breaks_labels = c("Moins de 1000 €", "Entre 1000 et 2000 €", "Plus de 2000 €")
+customers_c$tranche_sales = cut(customers_c$sales, breaks = breaks, labels = breaks_labels)
+rm(breaks, breaks_labels)
+
+# Création de la table de contingence à partir de la table des clients hors B to B
+age_sales = customers_c %>%
+  group_by(tranche_age, tranche_sales) %>%
+  summarise(customers = n())
+age_sales = pivot_wider(age_sales, names_from = tranche_age, values_from = customers)%>%
+  column_to_rownames("tranche_sales")
+age_sales = age_sales[order(nrow(age_sales):1),]
+# on vérifie ici que tous les effectifs sont supérieurs à 5
+
+# Table de contingence théorique si indépendance des variables
+age_sales_th = tcrossprod(rowSums(age_sales),colSums(age_sales))/total_customers_c
+
+# Table des écarts à l'indépendance measure et corr
+measure = (age_sales - age_sales_th)^2/age_sales_th
+khi_2 = sum(rowSums(measure, )) # calcul de la statistique khi_2
+corr = measure/khi_2 # Table normalisée par le khi-2
+
+# Affichage des résultats
+pheatmap(corr, display_numbers = TRUE, number_color = "black",
+         cluster_cols = FALSE, cluster_rows = FALSE, legend = FALSE,
+         angle_col = 0, color = hm_colors, 
+         fontsize = 8, fontsize_number = 12, fontsize_row=12, fontsize_col=12,
+         main = 'Carte de chaleur de participation à la corrélation des variables "Age" et "Montant total des achats"')
+
+cat("Valeur du khi-2 :")
+cat(khi_2)
+cat('\n')
+cat("Coefficient V de Cramer : ")
+cat(sqrt(khi_2/(2*total_customers_c)))
+
+# Test du Khi-2 avec calcul de la p_valeur
+chisq.test(age_sales)
+
+# Différence d'effectifs entre observations et distributions indépendantes
+age_sales - age_sales_th
+
+rm(corr, measure, khi_2)
+```
+
+On observe que la corrélation est principalemnt dûe à :
+
+-   une faible présence des plus de 54 ans dans les montants \> 2000 €
+
+-   une forte présence des plus de 54 ans dans les montants \< 1000 €
+
+-   une forte présence des 34-53 ans dans les montants \> 2000 €
+
+-   une faible présence des 34-53 ans dans les montants \< 1000 €
+
+On conclut notamment un montant des achats sensiblement plus faible après 54 ans Cette tendance pourrait s’expliquer par une utilisation moindre d’internet chez les plus âgés, qui n’utiliseraient la vente en ligne que pour des achats spécifiques
+
+## Age et fréquence d’achat
+
+On visualise tout d'abord les données grâce à un nuage de points
+
+```{r}
+# Nuage de points âge/fréquence
+ggplot(customers_c, mapping = aes(x = age, y = month_freq))+
+  geom_point(color = 'seagreen',alpha = 0.2)+
+  #geom_smooth(color = "grey30", level = 0)
+  labs(title = "Fréquence d'achat en fonction de l'âge des clients",
+       x = "Age", y = "Nombre d'achats par mois")
+```
+
+On note à nouveau un décrochage du nuage de point à 33, avec une corrélation qui semble exister mais non linéaire
+
+### Test de Spearman
+
+On va donc mesurer la corrélation entre les variables par un coefficient de Spearman
+
+```{r}
+cat("Coefficient de corrélation de Spearman entre âge et fréquence d'achat: ")
+cor(customers$age,customers$month_freq, method="spearman")
+
+```
+
+Il indique une faible corrélation positive entre les deux variables, c'est-à-dire que les personnes plus âgées achèteraient plus fréquemment que les personnes les plus jeunes. Cette tendance semble très simplifiée à la lecture du nuage de points. On l'affinera par une table de contingence.
+
+### Test de Kruskal-Wallis
+
+On va d'abord tester l'indépendance des variables en discrétisant l'âge des clients selon les tranches d'âges déjà définies.
+
+On visualise les données après discrétisation par tranche d'âge
+
+```{r}
+ggplot(customers_c, mapping = aes(x = tranche_age, y = month_freq))+
+  geom_violin(fill = "lightyellow3")+
+  geom_boxplot(width = 0.1, outliers = FALSE, linewidth = 0.5)+
+  labs(title = "Fréquence d'achat en fonction de l'âge des clients", x = "Tranche d'âge", y = "Nombre d'achats par mois")
+```
+
+On vérifie que les groupes ne respectent pas les conditions d'un test ANOVA : égalité des variances et loi normale
+
+```{r}
+# Identification des 3 groupes étudiés
+a0 = (customers_c |> filter(tranche_age == "moins de 33 ans"))$month_freq
+a1 = (customers_c |> filter(tranche_age == "de 34 à 53 ans"))$month_freq
+a2 = (customers_c |> filter(tranche_age == "plus de 54 ans"))$month_freq
+
+# Comparaison des variances de chaque groupe
+cat("Variance de la fréquence d'achat groupés par tranche d'âge :")
+cat('\n Moins de 33 ans :', var(a0))
+cat('\n De 34 à 53 ans :', var(a1))
+cat('\n Plus de 54 ans :', var(a2))
+cat('\n\n\n')
+
+# Test de Kolmogorov-Smirnov pour tester l'adéquation des répartitions à des lois normales
+cat(" Tests d'adéquation de chaque distribution à une loi normale :")
+cat('\n\n\n')
+ks.test(a0, "pnorm", mean(a0), sd(a0))
+ks.test(a1, "pnorm", mean(a1), sd(a1))
+ks.test(a2, "pnorm", mean(a2), sd(a2))
+
+rm(a0,a1,a2)
+```
+
+```{r}
+kruskal.test(month_freq ~ tranche_age, data = customers_c)
+```
+
+p-value \< 2.2e-16 \<\< 5% ; on peut donc rejeter l'hypothèse d'indépendance des variables
+
+### Table de contingence et test du Khi-deux
+
+Pour réaliser notre table de contingence et la carte de chaleur des tendances d'association, nous discrétisons la variable "fréquence d'achat", en s'assurant que les effectifs de tous les groupes sont supérieurs à 5.
+
+```{r}
+
+# Création des tranches de fréquence dans une nouvelle colonne de customers_c
+breaks = c(0,1,2,ceiling(max(customers_c$month_freq)))
+breaks_labels = c("Moins de 1 achat par mois", "Entre 1 et 2 achat par mois", "Plus de 2 achats par mois")
+customers_c$tranche_month_freq = cut(customers_c$month_freq, breaks = breaks, labels = breaks_labels)
+
+rm(breaks, breaks_labels)
+
+# Création de la table de contingence à partir de la table des clients hors B to B
+age_freq = customers_c %>%
+  group_by(tranche_age, tranche_month_freq) %>%
+  summarise(customers = n())
+age_freq = pivot_wider(age_freq, names_from = tranche_age, values_from = customers)%>%
+  column_to_rownames("tranche_month_freq")
+age_freq = age_freq[order(nrow(age_freq):1),]
+# on vérifie ici que tous les effectifs sont supérieurs à 5
+
+# Table de contingence théorique si indépendance des variables
+age_freq_th = tcrossprod(rowSums(age_freq),colSums(age_freq))/total_customers_c
+
+# Table des écarts à l'indépendance measure et corr
+measure = (age_freq - age_freq_th)^2/age_freq_th
+khi_2 = sum(rowSums(measure, ))
+corr = measure/khi_2 # Tablel normalisée par le khi-2
+
+# Affichage des résultats
+pheatmap(corr, display_numbers = TRUE, number_color = "black",
+         cluster_cols = FALSE, cluster_rows = FALSE, legend = FALSE,
+         angle_col = 0, color = hm_colors, 
+         fontsize = 8, fontsize_number = 12, fontsize_row=12, fontsize_col=12,
+         #labels_row = c("Catégorie 0", "Catégorie 1", "Catégorie 2"),
+         labels_col = c("moins de 33 ans", "de 34 à 53 ans", "plus de 54 ans"),
+         main = 'Carte de chaleur de participation à la corrélation des variables "Age" et "Fréquence d\'achat"')
+
+cat("Valeur du khi-2 :")
+cat(khi_2)
+cat('\n')
+cat("Coefficient V de Cramer : ")
+cat(sqrt(khi_2/(2*total_customers_c)))
+
+# Test du Khi-2 avec calcul de la p_valeur
+chisq.test(age_freq)
+
+# Différence d'effectifs entre observations et distributions indépendantes
+age_freq - age_freq_th
+
+rm(corr, measure, khi_2)
+```
+
+La corrélation est principalement due à :
+
+-   une faible présence des moins de 30 ans dans les fréquences supérieures à 2/mois
+
+-   une forte présence des moins de 30 ans dans les fréquences inférieures à 1/mois
+
+-   une tendance inverse et plus faible chez les 34-53 ans
+
+Un nombre de transactions supérieures à 2 par mois peut laisser supposer un client de type business, même petit, ce qui est effectivement plus probable dans la tranche 34-53 ans
+
+Les clients les plus jeunes se tournent probablement plus facilement vers la vente en ligne malgré des achats peu fréquents. Les personnes plus âgées s’y tourneraient au contraire par commodité seulement lorsqu’ils réalisent beaucoup d’achats
+
+## Age et taille du panier moyen
+
+On visualise tout d'abord les données grâce à un nuage de points
+
+```{r}
+ggplot(customers_c, mapping = aes(x = age, y = average_number))+
+  geom_point(color = 'seagreen',alpha = 0.2)+
+  #geom_smooth(color = "grey30", level = 0)+
+  labs(title = "Taille du panier moyen en fonction de l'âge des clients",
+       x = "Age", y = "Panier moyen (nombre de produits)")
+```
+
+On observe peu de paniers moyens faibles dans la tranche 34-53 ans, contrairement aux plus jeunes et aux plus âgés qui présentent des paniers moyens répartis à partir de 1 produit/panier
+
+On peut réutiliser les tranches d'âge déjà définies
+
+La tendance, encore une fois, n'est pas linéaire.
+
+### Test de Spearmann
+
+On va donc mesurer la corrélation entre les variables par un coefficient de Spearman
+
+```{r}
+cat("Coefficient de corrélation de Spearman entre âge et taille du panier moyen : ")
+cor(customers$age,customers$average_number, method="spearman")
+
+```
+
+### Test de Kruskal-Wallis
+
+On réutilise la discrétisation en tranche d'âge, qui correspond aux observations du nuage de points.
+
+On visualise les données après discrétisation par tranche d'âge
+
+```{r}
+
+ggplot(customers_c, mapping = aes(x = tranche_age, y = average_number))+
+  geom_violin(fill = "lightyellow3")+
+  geom_boxplot(width = 0.1, outliers = FALSE)+
+  labs(title = "taille du panier moyen en fonction de l'âge des clients", x = "Tranche d'âge", y = "Panier moyen (nombre de produits)")
+
+
+```
+
+On vérifie que les groupes ne respectent pas les conditions d'un test ANOVA : égalité des variances et loi normale
+
+```{r}
+# Identification des 3 groupes étudiés
+a0 = (customers_c |> filter(tranche_age == "moins de 33 ans"))$average_number
+a1 = (customers_c |> filter(tranche_age == "de 34 à 53 ans"))$average_number
+a2 = (customers_c |> filter(tranche_age == "plus de 54 ans"))$average_number
+
+# Comparaison des variances de chaque groupe
+cat("Variance de la taille du panier moyen groupé par tranche d'âge :")
+cat('\n Moins de 33 ans :', var(a0))
+cat('\n De 34 à 53 ans :', var(a1))
+cat('\n Plus de 54 ans :', var(a2))
+cat('\n\n\n')
+
+# Test de Kolmogorov-Smirnov pour tester l'adéquation des répartitions à des lois normales
+cat(" Tests d'adéquation de chaque distribution à une loi normale :")
+cat('\n\n\n')
+ks.test(a0, "pnorm", mean(a0), sd(a0))
+ks.test(a1, "pnorm", mean(a1), sd(a1))
+ks.test(a2, "pnorm", mean(a2), sd(a2))
+
+rm(a0,a1,a2)
+```
+
+On réalise donc un test de Kruskal-Wallis :
+
+-   H0 : Les variables sont indépendantes
+
+-   H1 : Les variables ne sont pas indépendantes
+
+```{r}
+kruskal.test(average_number ~ tranche_age, data = customers_c)
+```
+
+p-value \< 2.2e-16 \<\< 5% ; on peut donc rejeter l'hypothèse d'indépendance des variables
+
+### Table de contingence et test du Khi-deux
+
+Pour réaliser notre table de contingence et la carte de chaleur des tendances d'association, nous discrétisons la variable "taille du panier moyen", en s'assurant que les effectifs de tous les groupes sont supérieurs à 5.
+
+```{r}
+
+# Création des taille de panier dans une nouvelle colonne de customers_c
+breaks = c(1,2,3,ceiling(max(customers_c$average_number)))
+breaks_labels = c("Moins de 2 articles par mois", "Entre 2 et 3 articles par mois", "Plus de 3 articles par mois")
+customers_c$tranche_basket_number = cut(customers_c$average_number,
+                                        labels = breaks_labels, breaks = breaks,include.lowest = TRUE)
+rm(breaks, breaks_labels)
+
+# Création de la table de contingence à partir de la table des clients hors B to B
+age_basket_number = customers_c %>%
+  group_by(tranche_age, tranche_basket_number) %>%
+  summarise(customers = n())
+age_basket_number = pivot_wider(age_basket_number, 
+                                names_from = tranche_age,
+                                values_from = customers)%>%
+  column_to_rownames("tranche_basket_number")
+age_basket_number = age_basket_number[order(nrow(age_basket_number):1),]
+# on vérifie ici que tous les effectifs sont supérieurs à 5
+
+# Table de contingence théorique si indépendance des variables
+age_basket_number_th = tcrossprod(rowSums(age_basket_number),
+                                  colSums(age_basket_number))/total_customers_c
+
+# Table des écarts à l'indépendance measure et corr
+measure = (age_basket_number - age_basket_number_th)^2/age_basket_number_th
+khi_2 = sum(rowSums(measure, ))
+corr = measure/khi_2 # Tablel normalisée par le khi-2
+
+# Affichage des résultats
+pheatmap(corr, display_numbers = TRUE, number_color = "black",
+         cluster_cols = FALSE, cluster_rows = FALSE, legend = FALSE,
+         angle_col = 0, color = hm_colors, 
+         fontsize = 8, fontsize_number = 12, fontsize_row=12, fontsize_col=12,
+         main = 'Carte de chaleur de participation à
+         la corrélation des variables "Age" et "Fréquence d\'achat"')
+
+cat("Valeur du khi-2 :")
+cat(khi_2)
+cat('\n')
+cat("Coefficient V de Cramer : ")
+cat(sqrt(khi_2/(2*total_customers_c)))
+
+# Test du Khi-2 avec calcul de la p_valeur
+chisq.test(age_freq)
+
+# Différence d'effectifs
+age_basket_number - age_basket_number_th
+
+rm(corr, measure, khi_2)
+```
+
+La corrélation est principalement due à :
+
+-   une forte présence des 34-53 ans dans les paniers de 2 à 3 articles
+
+-   une faible présence des 34-53 ans dans les paniers de moins de 2 produits
+
+-   une tendance inverse et plus faible chez les plus de 54 ans
+
+Cet écart peut s’expliquer par :
+
+-   Un meilleur pouvoir d’achat des 34-53 ans
+
+-   Des achats plus anticipés et ciblés chez les plus de 54 ans
+
+-   Une possible présence d’entreprises dans la tranche 34-53 ans
+
+## Age et montant du panier moyen
+
+On visualise tout d'abord les données grâce à un nuage de points
+
+```{r}
+ggplot(customers_c, mapping = aes(x = age, y = average_basket))+
+  geom_point(color = 'seagreen',alpha = 0.2)+
+  #geom_smooth(color = "grey30", level = 0)+
+  labs(title = "Panier moyen en fonction de l'âge des clients",
+       x = "Age", y = "Panier moyen (€)")
+```
+
+On observe un panier moyen plus elevé chez les clients les plus jeunes, avec un décrochage net à 33 ans, puis une tendance plate pour les clients de plus de 30 ans. On peut réutiliser les tranches d'âge déjà définies
+
+La tendance, encore une fois, n'est pas linéaire.
+
+### Test de Spearmann
+
+On va donc mesurer la corrélation entre les variables par un coefficient de Spearman
+
+```{r}
+cat("Coefficient de corrélation de Spearman entre âge et montant du panier moyen : ")
+cor(customers$age,customers$average_basket, method="spearman")
+
+```
+
+### Test de Kruskal-Wallis
+
+On réutilise la discrétisation en tranche d'âge, qui correspond aux observations du nuage de points
+
+On visualise les données après discrétisation par tranche d'âge
+
+```{r}
+
+ggplot(customers_c, mapping = aes(x = tranche_age, y = average_basket))+
+  geom_violin(fill = "lightyellow3")+
+  geom_boxplot(width = 0.1, outliers = FALSE)+
+  scale_y_continuous(limits = c(0,150))+
+  labs(title = "Panier moyen en fonction de l'âge des clients", x = "Tranche d'âge", y = "Panier moyen (€)")
+```
+
+On vérifie que les groupes ne respectent pas les conditions d'un test ANOVA : égalité des variances et loi normale
+
+```{r}
+# Identification des 3 groupes étudiés
+a0 = (customers_c |> filter(tranche_age == "moins de 33 ans"))$average_basket
+a1 = (customers_c |> filter(tranche_age == "de 34 à 53 ans"))$average_basket
+a2 = (customers_c |> filter(tranche_age == "plus de 54 ans"))$average_basket
+
+# Comparaison des variances de chaque groupe
+cat("Variance du montant du panier moyen groupé par tranche d'âge :")
+cat('\n Moins de 33 ans :', var(a0))
+cat('\n De 34 à 53 ans :', var(a1))
+cat('\n Plus de 54 ans :', var(a2))
+cat('\n\n\n')
+
+# Test de Kolmogorov-Smirnov pour tester l'adéquation des répartitions à des lois normales
+cat(" Tests d'adéquation de chaque distribution à une loi normale :")
+cat('\n\n\n')
+ks.test(a0, "pnorm", mean(a0), sd(a0))
+ks.test(a1, "pnorm", mean(a1), sd(a1))
+ks.test(a2, "pnorm", mean(a2), sd(a2))
+
+rm(a0,a1,a2)
+```
+
+On réalise donc un test de Kruskal-Wallis :
+
+-   H0 : Les variables sont indépendantes
+
+-   H1 : Les variables ne sont pas indépendantes
+
+```{r}
+kruskal.test(average_basket ~ tranche_age, data = customers_c)
+```
+
+p-value \< 2.2e-16 \<\< 5% ; on peut donc rejeter l'hypothèse d'indépendance des variables
+
+### Table de contingence et test du Khi-deux
+
+Pour réaliser notre table de contingence et la carte de chaleur des tendances d'association, nous discrétisons la variable "montant du panier moyen", en s'assurant que les effectifs de tous les groupes sont supérieurs à 5.
+
+```{r}
+# Création des tranches de montants de panier dans une nouvelle colonne de customers_c
+breaks = c(0,25,50,ceiling(max(customers_c$average_basket)))
+breaks_labels = c("Moins de 25 €", "Entre 25 et 50 €", "Plus de 50 €")
+customers_c$tranche_basket = cut(customers_c$average_basket, breaks = breaks, labels = breaks_labels)
+rm(breaks, breaks_labels)
+
+# Création de la table de contingence à partir de la table des clients hors B to B
+age_basket = customers_c %>%
+  group_by(tranche_age, tranche_basket) %>%
+  summarise(customers = n())
+age_basket = pivot_wider(age_basket, names_from = tranche_age, values_from = customers)%>%
+  column_to_rownames("tranche_basket")
+age_basket = age_basket[order(nrow(age_basket):1),]
+# on vérifie ici que tous les effectifs sont supérieurs à 5
+
+# Table de contingence théorique si indépendance des variables
+age_basket_th = tcrossprod(rowSums(age_basket),colSums(age_basket))/total_customers_c
+
+# Table des écarts à l'indépendance measure et corr
+measure = (age_basket - age_basket_th)^2/age_basket_th
+khi_2 = sum(rowSums(measure, ))
+corr = measure/khi_2 # Tablel normalisée par le khi-2
+
+# Affichage des résultats
+pheatmap(corr, display_numbers = TRUE, number_color = "black",
+         cluster_cols = FALSE, cluster_rows = FALSE, legend = FALSE,
+         angle_col = 0, color = hm_colors, 
+         fontsize = 8, fontsize_number = 12, fontsize_row=12, fontsize_col=12,
+         main = 'Carte de chaleur de participation à la corrélation des variables "Age" et "Panier moyen"')
+
+cat("Valeur du khi-2 :")
+cat(khi_2)
+cat('\n')
+cat("Coefficient V de Cramer : ")
+cat(sqrt(khi_2/(2*total_customers_c)))
+
+# Test du Khi-2 avec calcul de la p_valeur
+chisq.test(age_freq)
+
+# Différence d'effectifs entre observations et répartition indépendante
+age_basket - age_basket_th
+
+rm(measure, khi_2, corr)
+```
+
+Coefficient V de Cramer = 0,65 soit une forte corrélation
+
+La corrélation est principalement due à une forte présence des moisnde 33 ans dans les paniers de plus de 50 €, ce qui s'explique a priori par la sur-représentation des plus jeunes dans les achats de catégorie 2, dont les prix dépassent souvent 50 €.
+
+# Conclusion
+
+Evolution des ventes :
+
+-   Les ventes ont connu de fortes perturbations de mi-2021 à début 2022, avec une stabilisation en 2022
+
+-   Les perturbations ont probablement des origines multiples : législation, évolution des pratiques d’achat après le Covid, peut-être une évolution du site et du catalogue
+
+Analyse des catégories :
+
+-   La catégorie 0, qui constitue 70% du catalogue, est bon marché et très présente dans le flop des ventes
+
+-   La catégorie 1 est très présente dans le top des ventes et très vendue en proportion
+
+-   La catégorie 2 est nettement plus chère et peu vendue, et contient peu de références
+
+L’âge impacte principalement la fréquence d’achat, la taille du panier et le montant du panier :
+
+-   Les moins de 33 ans achètent rarement, peu d’articles, des produits plus chers, et des paniers plus chers. Ils sont les principaux clients de la catégorie 2
+
+-   Les 34-53 ans sont les meilleurs clients en montant total d’achats. Ils mettent plus d’articles dans leur panier et achètent plus fréquemment. Certains représentent peut-être de petites entreprises
+
+-   Les plus de 54 ans dépensent sensiblement moins par an, et mettent peu d’articles dans leur panier
